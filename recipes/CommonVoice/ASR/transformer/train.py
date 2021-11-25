@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+import sys
+import argparse
+import os
+import csv
+from warnings import catch_warnings
+import torch
+import logging
+import speechbrain as sb
+import torchaudio
+from hyperpyyaml import load_hyperpyyaml
+from speechbrain.tokenizers.SentencePiece import SentencePiece
+from speechbrain.utils.data_utils import undo_padding
+from speechbrain.utils.distributed import run_on_main
 """Recipe for training a Transformer ASR system with CommonVoice
 The system employs an encoder, a decoder, and an attention mechanism
 between them. Decoding is performed with (CTC/Att joint) beamsearch.
@@ -24,29 +37,40 @@ Authors
  * Titouan Parcollet 2021
  * Jianyuan Zhong 2020
 """
-import sys
-import torch
-import torchaudio
-import logging
-import speechbrain as sb
-from hyperpyyaml import load_hyperpyyaml
-from speechbrain.tokenizers.SentencePiece import SentencePiece
-from speechbrain.utils.distributed import run_on_main
-from speechbrain.utils.data_utils import undo_padding
-
 
 logger = logging.getLogger(__name__)
 
 
 # Define training procedure
 class ASR(sb.core.Brain):
+    # def __init__(
+    #     self,
+    #     modules=None,
+    #     opt_class=None,
+    #     hparams=None,
+    #     run_opts=None,
+    #     checkpointer=None,
+    # ):
+    #     super().__init__(modules, opt_class, hparams, run_opts, checkpointer,)
+    #     # self.tr_acc_csv_h = open(hparams['train_acc_stats_file'], 'a', newline='')
+    #     # self.tr_loss_csv_h = open(hparams['train_loss_stats_file'], 'a', newline='')
+
+    #     # self.tr_acc_wrtr = csv.writer(self.tr_acc_csv_h, delimiter=',',
+    #     #                     quotechar='|', quoting=csv.QUOTE_MINIMAL)
+    #     # self.tr_loss_wrtr = csv.writer(self.tr_loss_csv_h, delimiter=',',
+    #     #                     quotechar='|', quoting=csv.QUOTE_MINIMAL)
+
+
+    #     # self.tr_acc_wrtr.writerow([1, 4, 5])
+
     def compute_forward(self, batch, stage):
         """Forward computations from the waveform batches to the output probabilities."""
+
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
-        wavs, wav_lens = wavs.to(self.device), wav_lens.to(self.device)
         tokens_bos, _ = batch.tokens_bos
-
+        wavs, wav_lens = wavs.to(self.device), wav_lens.to(self.device)
+        
         # compute features
         feats = self.hparams.compute_features(wavs)
         current_epoch = self.hparams.epoch_counter.current
@@ -136,6 +160,16 @@ class ASR(sb.core.Brain):
         predictions = self.compute_forward(batch, sb.Stage.TRAIN)
         loss = self.compute_objectives(predictions, batch, sb.Stage.TRAIN)
 
+        tokens_eos, tokens_eos_lens = batch.tokens_eos
+        (_, p_seq, _, _,) = predictions
+        self.acc_tr_metric.append(p_seq, tokens_eos, tokens_eos_lens)
+
+        self.tr_acc_arr.append(self.acc_tr_metric.summarize())
+        self.tr_loss_arr.append(loss.detach().cpu().numpy())
+
+        # self.tr_stats["TR_ACC"][str(self.step)] = self.acc_tr_metric.summarize()
+        # self.tr_stats["TR_LOSS"][str(self.step)] = loss.detach().cpu()
+
         # normalize the loss by gradient_accumulation step
         (loss / self.hparams.gradient_accumulation).backward()
 
@@ -148,6 +182,7 @@ class ASR(sb.core.Brain):
 
             # anneal lr every update
             self.hparams.noam_annealing(self.optimizer)
+
 
         return loss.detach()
 
@@ -164,13 +199,55 @@ class ASR(sb.core.Brain):
             self.acc_metric = self.hparams.acc_computer()
             self.cer_metric = self.hparams.cer_computer()
             self.wer_metric = self.hparams.error_rate_computer()
+        else:
+            self.tr_acc_csv_h = open(hparams['train_acc_stats_file'], 'a', newline='')
+            self.tr_loss_csv_h = open(hparams['train_loss_stats_file'], 'a', newline='')
+
+            self.tr_acc_wrtr = csv.writer(self.tr_acc_csv_h, delimiter=',',
+                                quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            self.tr_loss_wrtr = csv.writer(self.tr_loss_csv_h, delimiter=',',
+                                quotechar='|', quoting=csv.QUOTE_MINIMAL)
+
+            self.tr_acc_arr = [epoch]
+            self.tr_loss_arr = [epoch]
+            # self.tr_stats["TR_ACC"] = {}
+            # self.tr_stats["TR_LOSS"] = {}
+
+            # TODO: Check if needed
+            self.acc_tr_metric = self.hparams.acc_computer()
 
     def on_stage_end(self, stage, stage_loss, epoch):
-        """Gets called at the end of a epoch."""
+        """Gets called at the end of an epoch."""
         # Compute/store important stats
         stage_stats = {"loss": stage_loss}
         if stage == sb.Stage.TRAIN:
             self.train_stats = stage_stats
+
+            # self.tr_stats["TR_ACC"]['epoch']
+
+            self.tr_acc_wrtr.writerow(self.tr_acc_arr)
+            self.tr_loss_wrtr.writerow(self.tr_loss_arr)
+
+            self.tr_acc_csv_h.close()
+            self.tr_loss_csv_h.close()
+
+            # torch.save(self.tr_stats["TR_ACC"][epoch], '{}.pt'.format(
+            #     self.hparams.train_acc_stats_file))
+            # torch.save(self.tr_stats["TR_ACC"], '{}_ep{}.pt'.format(
+                # self.hparams.train_acc_stats_file, epoch))
+
+            # torch.save(self.tr_stats["TR_LOSS"], '{}_ep{}.pt'.format(
+            #     self.hparams.train_loss_stats_file, epoch))
+
+            # self.train_stats['comp_tr_epoch'] = epoch
+            # torch.save(self.tr_stats, self.hparams.train_stats_file)
+            # stage_stats["ACC"][str(epoch)] = self.acc_tr_metric.summarize()
+            # plt.figure(figsize=(8, 4), dpi=100)
+            # plt.plot(stage_loss)
+            # plt.grid()
+            # plt.show()
+            # plt.savefig
+
         else:
             stage_stats["ACC"] = self.acc_metric.summarize()
             current_epoch = self.hparams.epoch_counter.current
@@ -181,6 +258,15 @@ class ASR(sb.core.Brain):
             ):
                 stage_stats["WER"] = self.wer_metric.summarize("error_rate")
                 stage_stats["CER"] = self.cer_metric.summarize("error_rate")
+
+                self.tr_stats['WER']['epoch'].append(epoch)
+                self.tr_stats['WER']['wer'].append(stage_stats["WER"])
+
+                self.tr_stats['CER']['epoch'].append(epoch)
+                self.tr_stats['CER']['cer'].append(stage_stats["CER"])
+
+                # self.tr_stats['CER'].append(stage_stats["CER"])
+                torch.save(self.tr_stats, self.hparams.train_stats_file)
 
         # log stats and save checkpoint at end-of-epoch
         if stage == sb.Stage.VALID and sb.utils.distributed.if_main_process():
@@ -200,12 +286,25 @@ class ASR(sb.core.Brain):
                 "epoch": epoch,
                 "lr": lr,
                 "steps": steps,
-                "optimizer": optimizer,
+                # "optimizer": optimizer,
             }
+
+            self.tr_stats['epoch'].append(epoch)
+            self.tr_stats['tr_loss'].append(self.train_stats['loss'])
+            self.tr_stats['val_loss'].append(stage_stats['loss'])
+            self.tr_stats['lr'].append(lr)
+            self.tr_stats['optimizer'].append(optimizer)
+            self.tr_stats['ACC'].append(stage_stats["ACC"])
+            torch.save(self.tr_stats, self.hparams.train_stats_file)
+
+
+            # Plot important graphs
+
             self.hparams.train_logger.log_stats(
                 stats_meta=epoch_stats,
                 train_stats=self.train_stats,
                 valid_stats=stage_stats,
+                verbose=True
             )
             self.checkpointer.save_and_keep_only(
                 meta={"ACC": stage_stats["ACC"], "epoch": epoch},
@@ -213,9 +312,14 @@ class ASR(sb.core.Brain):
             )
 
         elif stage == sb.Stage.TEST:
+
+            self.tr_stats['tst_loss'].append(stage_stats['loss'])
+            torch.save(self.tr_stats, self.hparams.train_stats_file)
+            
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
                 test_stats=stage_stats,
+                verbose=True
             )
             with open(self.hparams.wer_file, "w") as w:
                 self.wer_metric.write_stats(w)
@@ -261,6 +365,51 @@ class ASR(sb.core.Brain):
             self.checkpointer.recover_if_possible(
                 device=torch.device(self.device)
             )
+
+            # try:
+            #     self.tr_stats = torch.load(self.hparams.train_stats_file)
+            # except:
+            #     print('file {} not found'.format(self.hparams.train_stats_file))
+                # self.tr_stats = {
+                #     'epoch': [],
+                #     'tr_loss': [],
+                #     'val_loss': [],
+                #     'tst_loss': [],
+                #     'lr': [],
+                #     'optimizer': [],
+                #     'ACC': [],
+                #     'TR_ACC': {},
+                #     'TR_LOSS': {},
+                #     'WER': {
+                #         'epoch': [],
+                #         'wer': []
+                #     },
+                #     'CER': {
+                #         'epoch': [],
+                #         'cer': []
+                #     }
+                # }
+        # else:
+        #     self.tr_stats = {
+        #             'epoch': [],
+        #             'tr_loss': [],
+        #             'val_loss': [],
+        #             'tst_loss': [],
+        #             'lr': [],
+        #             'optimizer': [],
+        #             'ACC': [],
+        #             'TR_ACC': {},
+        #             'TR_LOSS': {},
+        #             'WER': {
+        #                 'epoch': [],
+        #                 'wer': []
+        #             },
+        #             'CER': {
+        #                 'epoch': [],
+        #                 'cer': []
+        #             }
+        #     }
+
 
         # if the model is resumed from stage two, reinitialize the optimizer
         current_epoch = self.hparams.epoch_counter.current
@@ -326,7 +475,10 @@ def dataio_prepare(hparams, tokenizer):
     )
 
     # We also sort the validation data so it is faster to validate
-    test_data = test_data.filtered_sorted(sort_key="duration")
+    test_data = test_data.filtered_sorted(
+        sort_key="duration",
+        key_max_value={"duration": hparams["avoid_if_longer_than_test"]},
+    )
 
     datasets = [train_data, valid_data, test_data]
 
@@ -335,7 +487,7 @@ def dataio_prepare(hparams, tokenizer):
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
         info = torchaudio.info(wav)
-        sig = sb.dataio.dataio.read_audio(wav)
+        sig, _ = sb.dataio.dataio.read_audio(wav)
         resampled = torchaudio.transforms.Resample(
             info.sample_rate, hparams["sample_rate"],
         )(sig)
@@ -373,6 +525,10 @@ if __name__ == "__main__":
     hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
+
+
+    if not os.path.isfile('{}/save/train.csv'.format(hparams['output_folder'])):
+        os.system('cp -rv ref_dir/* {}/'.format(hparams['output_folder']))
 
     # If distributed_launch=True then
     # create ddp_group with the right communication protocol
@@ -428,14 +584,61 @@ if __name__ == "__main__":
     # adding objects to trainer:
     asr_brain.tokenizer = tokenizer
 
-    # Training
-    asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
-        train_data,
-        valid_data,
-        train_loader_kwargs=hparams["train_dataloader_opts"],
-        valid_loader_kwargs=hparams["valid_dataloader_opts"],
-    )
+
+
+
+    try:
+        asr_brain.tr_stats = torch.load(hparams['train_stats_file'])
+    except:
+        print('file {} not found'.format(hparams['train_stats_file']))
+
+        tr_num_samples = hparams['train_dataloader_opts'].get('num_samples', 759546)
+        val_num_samples = hparams['valid_dataloader_opts'].get('num_samples', 16264)
+        tr_param = {
+            'max_epoch': hparams['number_of_epochs'],
+            'tr_num_samples': tr_num_samples,
+            'tr_batch': hparams['train_dataloader_opts']['batch_size'],
+            'val_batch': hparams['valid_dataloader_opts']['batch_size'],
+            'val_num_samples': val_num_samples,
+        }
+        asr_brain.tr_stats = {
+            'epoch': [],
+            'tr_loss': [],
+            'val_loss': [],
+            'tst_loss': [],
+            'lr': [],
+            'optimizer': [],
+            'ACC': [],
+            'TR_ACC': {},
+            'TR_LOSS': {},
+            'WER': {
+                'epoch': [],
+                'wer': []
+            },
+            'CER': {
+                'epoch': [],
+                'cer': []
+            }
+        }
+
+        torch.save(tr_param, hparams['train_stats_param_file'])
+
+    
+    try:
+        os.mkdir(hparams['train_stat_dir'])
+    except:
+        print('Training stat dir exists')
+
+
+    if not run_opts['skip_train']:
+        # Training
+        asr_brain.fit(
+            asr_brain.hparams.epoch_counter,
+            train_data,
+            valid_data,
+            train_loader_kwargs=hparams["train_dataloader_opts"],
+            valid_loader_kwargs=hparams["valid_dataloader_opts"],
+        )
 
     # Test
     asr_brain.hparams.wer_file = hparams["output_folder"] + "/wer_test.txt"
