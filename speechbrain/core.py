@@ -256,6 +256,12 @@ def parse_arguments(arg_list=None):
         help="Amount of time between saving intra-epoch checkpoints "
         "in minutes. If non-positive, intra-epoch checkpoints are not saved.",
     )
+    parser.add_argument(
+        "--skip_train",
+        default=False,
+        action="store_true",
+        help="Skip training process",
+    )
 
     # Accept extra args to override yaml
     run_opts, overrides = parser.parse_known_args(arg_list)
@@ -675,6 +681,8 @@ class Brain:
         # TRAIN stage is handled specially.
         if stage == sb.Stage.TRAIN:
             loader_kwargs = self._train_loader_specifics(dataset, loader_kwargs)
+        elif (stage == sb.Stage.VALID or stage == sb.Stage.TEST):
+            loader_kwargs = self._valid_loader_specifics(dataset, loader_kwargs)
         dataloader = sb.dataio.dataloader.make_dataloader(
             dataset, **loader_kwargs
         )
@@ -691,19 +699,33 @@ class Brain:
             self.checkpointer.add_recoverable(ckpt_key, dataloader)
         return dataloader
 
+    def _valid_loader_specifics(self, dataset, loader_kwargs):
+        sampler = loader_kwargs.get("sampler", None)
+        shuffle = loader_kwargs.pop("shuffle", False)
+        num_samples = loader_kwargs.pop("num_samples", None)
+        replacement = loader_kwargs.pop("replacement", False)
+        sampler = ReproducibleRandomSampler(dataset, num_samples=num_samples, replacement=replacement)
+        # self.valid_sampler = sampler
+        loader_kwargs["sampler"] = sampler
+        
+        return loader_kwargs
+
     def _train_loader_specifics(self, dataset, loader_kwargs):
         sampler = loader_kwargs.get("sampler", None)
         # Shuffling should really only matter for the train stage. Shuffling
         # will also lead to more padding in batches if the order was otherwise
         # sorted by length.
         shuffle = loader_kwargs.get("shuffle", False)
+        num_samples = loader_kwargs.pop("num_samples", None)
+        replacement = loader_kwargs.pop("replacement", False)
         if shuffle and not self.distributed_launch:
             if sampler is not None:
                 raise ValueError(
                     "Cannot specify both shuffle=True "
                     "and a sampler in loader_kwargs"
                 )
-            sampler = ReproducibleRandomSampler(dataset)
+            sampler = ReproducibleRandomSampler(dataset, num_samples=num_samples, replacement=replacement)
+            # sampler = ReproducibleRandomSampler(dataset)
             self.train_sampler = sampler
             loader_kwargs["sampler"] = self.train_sampler
             # Delete the shuffle flag, since you cannot specify both a sampler and
@@ -980,6 +1002,11 @@ class Brain:
             Whether to display the progress of each epoch in a progressbar.
         """
 
+        tr_interval = train_loader_kwargs.pop('tr_interval', 0)
+        tr_step_print = train_loader_kwargs.pop('tr_step_print', 0)
+        val_interval = valid_loader_kwargs.pop('val_interval', 0)
+        val_step_print = valid_loader_kwargs.pop('val_step_print', 0)
+
         if not (
             isinstance(train_set, DataLoader)
             or isinstance(train_set, LoopedLoader)
@@ -1049,6 +1076,19 @@ class Brain:
                     ):
                         run_on_main(self._save_intra_epoch_ckpt)
                         last_ckpt_time = time.time()
+                    
+                    if enable is False:
+                        if tr_interval > 0 and (self.step % int(t.total / tr_interval) == 0 or self.step == t.total):
+                            logger.info(
+                                "Info: Trained " + str(self.step) + " Out of Total: " + str(t.total)
+                                + " (" + str(int(self.step / t.total * 100)) + "%)"
+                            )
+                        if tr_step_print > 0 and (self.step % tr_step_print or self.step == t.total):
+                            logger.info(
+                                "Info: Trained " + str(self.step) + " Out of Total: " + str(t.total)
+                                + " (" + int(self.step / t.total * 100) + "%)"
+                            ) 
+
 
             # Run train "on_stage_end" on all processes
             self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
@@ -1073,6 +1113,18 @@ class Brain:
                         # Debug mode only runs a few batches
                         if self.debug and self.step == self.debug_batches:
                             break
+
+                        # if enable is False:
+                        #     if val_interval > 0 and (self.step % int(t.total / val_interval) == 0 or self.step == t.total):
+                        #         logger.info(
+                        #             "Info: Validated " + str(self.step) + " Out of Total: " + str(t.total)
+                        #             + " (" + str(int(self.step / t.total * 100)) + "%)"
+                        #         )
+                        #     if val_step_print > 0 and (self.step % val_step_print or self.step == t.total):
+                        #         logger.info(
+                        #             "Info: Validated " + str(self.step) + " Out of Total: " + str(t.total)
+                        #             + " (" + int(self.step / t.total * 100) + "%)"
+                        #         ) 
 
                     # Only run validation "on_stage_end" on main process
                     self.step = 0
