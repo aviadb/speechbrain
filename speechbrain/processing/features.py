@@ -43,6 +43,11 @@ from speechbrain.utils.checkpoints import (
     mark_as_transfer,
     register_checkpoint_hooks,
 )
+from speechbrain.processing.scalers import (
+    BarkScaler,
+    MelScaler,
+    ERBScaler
+)
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +421,8 @@ class Filterbank(torch.nn.Module):
         self,
         n_mels=40,
         log_mel=True,
+        root_cep=False,
+        root_coef=0.1,
         filter_shape="triangular",
         f_min=0,
         f_max=8000,
@@ -428,10 +435,15 @@ class Filterbank(torch.nn.Module):
         param_change_factor=1.0,
         param_rand_factor=0.0,
         freeze=True,
+        scale='mel',
+        bark_fix = False,
+        erb_approx = False
     ):
         super().__init__()
         self.n_mels = n_mels
         self.log_mel = log_mel
+        self.root_cep = root_cep
+        self.root_coef = root_coef
         self.filter_shape = filter_shape
         self.f_min = f_min
         self.f_max = f_max
@@ -462,10 +474,23 @@ class Filterbank(torch.nn.Module):
             logger.error(err_msg, exc_info=True)
 
         # Filter definition
-        mel = torch.linspace(
-            self._to_mel(self.f_min), self._to_mel(self.f_max), self.n_mels + 2
-        )
-        hz = self._to_hz(mel)
+        if scale == 'mel':
+            mel = torch.linspace(
+                self._to_mel(self.f_min), self._to_mel(self.f_max), self.n_mels + 2
+            )
+            hz = self._to_hz(mel)
+        elif scale == 'bark':
+            bark_scaler = BarkScaler()
+            bark_min, _ = bark_scaler.hz2bark(torch.tensor(f_min), 2, fix=bark_fix)
+            bark_max, _ = bark_scaler.hz2bark(torch.tensor(f_max), 2, fix=bark_fix)
+            bark = torch.linspace(bark_min, bark_max, n_mels + 2)
+            hz = bark_scaler.bark2hz(bark, fix=bark_fix)
+        elif scale == 'erb':
+            erb_scaler = ERBScaler()
+            erb_min, _ = erb_scaler.hz2erb(torch.tensor(f_min), approx=erb_approx)
+            erb_max, _ = erb_scaler.hz2erb(torch.tensor(f_max), approx=erb_approx)
+            erb = torch.linspace(erb_min, erb_max, n_mels + 2)
+            hz = erb_scaler.erb2hz(erb, approx=erb_approx)
 
         # Computation of the filter bands
         band = hz[1:] - hz[:-1]
@@ -548,6 +573,8 @@ class Filterbank(torch.nn.Module):
         fbanks = torch.matmul(spectrogram, fbank_matrix)
         if self.log_mel:
             fbanks = self._amplitude_to_DB(fbanks)
+        elif self.root_cep :
+            fbanks = torch.pow(fbanks, self.root_coef)
 
         # Reshaping in the case of multi-channel inputs
         if len(sp_shape) == 4:
