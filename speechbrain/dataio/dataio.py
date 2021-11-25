@@ -197,8 +197,8 @@ def read_audio(waveforms_obj):
     True
     """
     if isinstance(waveforms_obj, str):
-        audio, _ = torchaudio.load(waveforms_obj)
-        return audio.transpose(0, 1).squeeze(1)
+        audio, fs = torchaudio.load(waveforms_obj)
+        return audio.transpose(0, 1).squeeze(1), fs
 
     path = waveforms_obj["file"]
     start = waveforms_obj.get("start", 0)
@@ -208,7 +208,7 @@ def read_audio(waveforms_obj):
     num_frames = stop - start
     audio, fs = torchaudio.load(path, num_frames=num_frames, frame_offset=start)
     audio = audio.transpose(0, 1)
-    return audio.squeeze(1)
+    return audio.squeeze(1), fs
 
 
 def read_audio_multichannel(waveforms_obj):
