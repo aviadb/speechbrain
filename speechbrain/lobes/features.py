@@ -92,6 +92,9 @@ class Fbank(torch.nn.Module):
         right_frames=5,
         win_length=25,
         hop_length=10,
+        scale="mel",
+        bark_fix = False,
+        erb_approx = False
     ):
         super().__init__()
         self.deltas = deltas
@@ -117,6 +120,9 @@ class Fbank(torch.nn.Module):
             filter_shape=filter_shape,
             param_change_factor=param_change_factor,
             param_rand_factor=param_rand_factor,
+            scale=scale,
+            bark_fix = bark_fix,
+            erb_approx = erb_approx
         )
         self.compute_deltas = Deltas(input_size=n_mels)
         self.context_window = ContextWindow(
@@ -223,6 +229,12 @@ class MFCC(torch.nn.Module):
         right_frames=5,
         win_length=25,
         hop_length=10,
+        log_mel=True,
+        root_cep=False,
+        root_coef=0.1,
+        scale="mel",
+        bark_fix = False,
+        erb_approx = False
     ):
         super().__init__()
         self.deltas = deltas
@@ -243,12 +255,18 @@ class MFCC(torch.nn.Module):
             sample_rate=sample_rate,
             n_fft=n_fft,
             n_mels=n_mels,
+            log_mel=log_mel,
+            root_cep=root_cep,
+            root_coef=root_coef,
             f_min=f_min,
             f_max=f_max,
             freeze=not requires_grad,
             filter_shape=filter_shape,
             param_change_factor=param_change_factor,
             param_rand_factor=param_rand_factor,
+            scale=scale,
+            bark_fix = bark_fix,
+            erb_approx = erb_approx
         )
         self.compute_dct = DCT(input_size=n_mels, n_out=n_mfcc)
         self.compute_deltas = Deltas(input_size=n_mfcc)
